@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Compute §6.2 command→MCP compliance for a workspace.
+
+Reads:
+  <workspace>/prompt-log/prompts-YYYY-MM.jsonl   (Stop hook output)
+  <workspace>/prompt-log/local-tool-calls.jsonl  (PostToolUse hook output)
+
+For every prompt starting with /local-* it checks whether ≥1 internal-ollama
+tool call happened in the same conversation between the previous prompt's
+timestamp and the current prompt's timestamp. Compliance = matched / issued.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+from typing import Any
+
+LOCAL_CMD_PREFIXES = ("/local-review", "/local-explain", "/local-tests", "/local-refactor")
+TOOL_BY_CMD = {
+    "/local-review": "internal_code_review",
+    "/local-explain": "internal_explain_code",
+    "/local-tests": "internal_generate_tests",
+    "/local-refactor": "internal_refactor",
+}
+
+
+def _read_jsonl(path: str) -> list[dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    out: list[dict[str, Any]] = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def _load(workspace: str) -> tuple[list[dict], list[dict]]:
+    log_dir = os.path.join(workspace, "prompt-log")
+    prompts: list[dict] = []
+    for p in sorted(glob.glob(os.path.join(log_dir, "prompts-*.jsonl"))):
+        prompts.extend(_read_jsonl(p))
+    tool_calls = _read_jsonl(os.path.join(log_dir, "local-tool-calls.jsonl"))
+    return prompts, tool_calls
+
+
+def _match_cmd(prompt: str) -> str | None:
+    head = (prompt or "").strip().split()
+    if not head:
+        return None
+    for pfx in LOCAL_CMD_PREFIXES:
+        if head[0] == pfx or head[0].startswith(pfx):
+            return pfx
+    return None
+
+
+def analyze(prompts: list[dict], tool_calls: list[dict]) -> dict[str, Any]:
+    # Index prompts by conversation, sorted by timestamp
+    by_conv: dict[str, list[dict]] = {}
+    for p in prompts:
+        cid = p.get("conversation_id") or "?"
+        by_conv.setdefault(cid, []).append(p)
+    for cid in by_conv:
+        by_conv[cid].sort(key=lambda x: x.get("timestamp", ""))
+
+    # Index tool calls by conversation
+    tc_by_conv: dict[str, list[dict]] = {}
+    for tc in tool_calls:
+        cid = tc.get("conversation_id") or "?"
+        tc_by_conv.setdefault(cid, []).append(tc)
+    for cid in tc_by_conv:
+        tc_by_conv[cid].sort(key=lambda x: x.get("ts", ""))
+
+    rows: list[dict[str, Any]] = []
+    issued = matched = 0
+    for cid, turns in by_conv.items():
+        prev_ts = ""
+        for turn in turns:
+            cmd = _match_cmd(turn.get("prompt", ""))
+            ts = turn.get("timestamp", "")
+            if cmd is None:
+                prev_ts = ts
+                continue
+            issued += 1
+            expected_tool = TOOL_BY_CMD[cmd]
+            window_calls = [
+                tc for tc in tc_by_conv.get(cid, [])
+                if prev_ts < tc.get("ts", "") <= ts
+            ]
+            matching = [tc for tc in window_calls if tc.get("tool") == expected_tool]
+            ok = len(matching) >= 1
+            matched += 1 if ok else 0
+            rows.append({
+                "ts": ts,
+                "conversation_id": cid,
+                "command": cmd,
+                "expected_tool": expected_tool,
+                "calls_in_window": len(window_calls),
+                "matching_calls": len(matching),
+                "compliant": ok,
+            })
+            prev_ts = ts
+
+    compliance = (matched / issued) if issued else None
+    return {"issued": issued, "matched": matched,
+            "compliance": compliance, "rows": rows}
+
+
+def _print_table(result: dict[str, Any]) -> None:
+    rows = result["rows"]
+    if not rows:
+        print("No /local-* commands found in prompt-log.")
+        return
+    print(f"{'timestamp':<21}  {'conv':<10}  {'command':<16}  {'expected_tool':<24}  calls  match  ok")
+    for r in rows:
+        print(f"{r['ts']:<21}  {r['conversation_id'][:10]:<10}  "
+              f"{r['command']:<16}  {r['expected_tool']:<24}  "
+              f"{r['calls_in_window']:>5}  {r['matching_calls']:>5}  {'Y' if r['compliant'] else 'N'}")
+    print()
+    if result["compliance"] is None:
+        print("Compliance: n/a (no commands issued)")
+    else:
+        pct = result["compliance"] * 100
+        gate = "PASS (≥90%)" if pct >= 90 else "FAIL (<90%)"
+        print(f"Issued: {result['issued']}  Matched: {result['matched']}  "
+              f"Compliance: {pct:.1f}%  Gate: {gate}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workspace", nargs="?", default=os.getcwd())
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    args = ap.parse_args()
+    prompts, tool_calls = _load(args.workspace)
+    result = analyze(prompts, tool_calls)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        _print_table(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
