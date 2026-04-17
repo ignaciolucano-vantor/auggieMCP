@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Entry point for the internal-ollama MCP server.
+# Registered in ~/.augment/settings.json -> mcpServers.internal-ollama.command
+
+set -eu
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "$HERE/.." && pwd)"
+export PYTHONDONTWRITEBYTECODE=1
+exec /usr/bin/python3 "$PLUGIN_ROOT/src/server.py" "$@"
